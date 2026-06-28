@@ -10,3 +10,7 @@ chromadb
 pypdf
 pyyaml
 rdflib
+
+# Optional: only needed if you set ANALYST_PROVIDER=anthropic or =google
+langchain-anthropic
+langchain-google-genai

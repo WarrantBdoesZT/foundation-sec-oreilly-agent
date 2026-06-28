@@ -1,12 +1,16 @@
 """
 Local cybersecurity RAG tools for the Foundation-Sec + O'Reilly agent.
 
-- Local doc search: a Chroma vector store over a folder of PDFs/markdown/text.
-  Starts empty; ingest_docs.py adds content to it later. Logs which source
-  file(s) each result came from for easy verification.
-- NVD lookup: live query against the public NVD CVE API, triggered on any
-  vulnerability-sounding question (CVE IDs, or keywords like "exploit",
-  "vulnerability", "CVSS", "zero-day", "patch"). Logs the CVE IDs returned.
+- Local doc search: a Chroma vector store, tagged by 'framework' metadata
+  (mitre_attack, mitre_atlas, mitre_d3fend, owasp_top10, owasp_llm_top10,
+  nsa_zero_trust, general). search_local_docs accepts an optional list of
+  frameworks to filter to -- the orchestrator decides which frameworks are
+  relevant per question. Falls back to (and backfills from) unfiltered
+  search across everything when the filter is too narrow.
+- NVD lookup: live query against the public NVD CVE API. Set NVD_API_KEY
+  (free from https://nvd.nist.gov/developers/request-an-api-key) to avoid
+  NVD's aggressive unauthenticated rate limiting, which otherwise causes
+  intermittent ReadTimeout/404 failures.
 
 Both functions are fail-safe by design: any exception is caught and logged,
 returning an empty list rather than ever raising into the calling pipeline.
@@ -14,7 +18,7 @@ returning an empty list rather than ever raising into the calling pipeline.
 import os
 import re
 import json
-from typing import List
+from typing import List, Optional
 
 import httpx
 
@@ -22,13 +26,15 @@ CHROMA_DIR = os.environ.get("RAG_CHROMA_DIR", os.path.expanduser("~/sec-agent/ra
 EMBED_MODEL = os.environ.get("RAG_EMBED_MODEL", "nomic-embed-text")
 OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
 NVD_API_URL = "https://services.nvd.nist.gov/rest/json/cves/2.0"
+NVD_API_KEY = os.environ.get("NVD_API_KEY", "")
+NVD_TIMEOUT = 30  # unauthenticated NVD can be slow; authenticated is much faster
 
 CVE_PATTERN = re.compile(r"CVE-\d{4}-\d{4,7}", re.IGNORECASE)
-VULN_KEYWORDS = [
-    "vulnerability", "vulnerabilities", "exploit", "cvss", "zero-day",
-    "0-day", "patch", "rce", "remote code execution", "privilege escalation",
-    "cve",
-]
+
+KNOWN_FRAMEWORKS = {
+    "mitre_attack", "mitre_atlas", "mitre_d3fend",
+    "owasp_top10", "owasp_llm_top10", "nsa_zero_trust", "general",
+}
 
 _chroma_client = None
 _collection = None
@@ -55,8 +61,29 @@ def _get_collection():
     return _collection
 
 
-async def search_local_docs(query: str, n_results: int = 4) -> List[str]:
+def _build_where_clause(frameworks: Optional[List[str]]) -> Optional[dict]:
+    """Builds a Chroma where-filter from a list of framework names.
+    Returns None (no filter) if frameworks is empty/None, so callers always
+    get a sensible unfiltered fallback rather than an error."""
+    if not frameworks:
+        return None
+    valid = [f for f in frameworks if f in KNOWN_FRAMEWORKS]
+    if not valid:
+        return None
+    if len(valid) == 1:
+        return {"framework": valid[0]}
+    return {"framework": {"$in": valid}}
+
+
+async def search_local_docs(query: str, frameworks: Optional[List[str]] = None,
+                             n_results: int = 8) -> List[str]:
     """Search the local cybersecurity doc store. Returns a list of text chunks.
+
+    frameworks: optional list of framework tags to filter to (e.g.
+    ["mitre_attack", "mitre_d3fend"]). If the filtered search returns fewer
+    than n_results, the remainder is backfilled with an unfiltered search so
+    a too-narrow framework guess never starves an answer of context.
+
     Returns an empty list if the store is empty or unavailable -- never raises."""
     try:
         collection = _get_collection()
@@ -64,49 +91,94 @@ async def search_local_docs(query: str, n_results: int = 4) -> List[str]:
         if count == 0:
             print("[rag] local doc store is empty; skipping", flush=True)
             return []
-        results = collection.query(query_texts=[query], n_results=min(n_results, count))
-        docs = results.get("documents", [[]])[0]
-        metas = results.get("metadatas", [[]])[0]
-        chunks = []
-        for doc, meta in zip(docs, metas):
-            source = (meta or {}).get("source", "unknown")
-            chunks.append(f"[Local doc: {source}]\n{doc}")
 
-        sources = [(meta or {}).get("source", "unknown") for meta in metas]
-        print(f"[rag] local doc search returned {len(chunks)} chunk(s) from: {sources}", flush=True)
+        where = _build_where_clause(frameworks)
+        seen_ids = set()
+        chunks = []
+        sources = []
+
+        if where:
+            filtered = collection.query(query_texts=[query], n_results=min(n_results, count), where=where)
+            f_ids = filtered.get("ids", [[]])[0]
+            f_docs = filtered.get("documents", [[]])[0]
+            f_metas = filtered.get("metadatas", [[]])[0]
+            for cid, doc, meta in zip(f_ids, f_docs, f_metas):
+                seen_ids.add(cid)
+                source = (meta or {}).get("source", "unknown")
+                fw = (meta or {}).get("framework", "?")
+                chunks.append(f"[Local doc ({fw}): {source}]\n{doc}")
+                sources.append(f"{source}[{fw}]")
+
+        # Backfill with unfiltered search if the framework filter was too
+        # narrow (or absent) to reach n_results.
+        if len(chunks) < n_results:
+            remaining = n_results - len(chunks)
+            unfiltered = collection.query(query_texts=[query], n_results=min(n_results, count))
+            u_ids = unfiltered.get("ids", [[]])[0]
+            u_docs = unfiltered.get("documents", [[]])[0]
+            u_metas = unfiltered.get("metadatas", [[]])[0]
+            for cid, doc, meta in zip(u_ids, u_docs, u_metas):
+                if cid in seen_ids:
+                    continue
+                if remaining <= 0:
+                    break
+                source = (meta or {}).get("source", "unknown")
+                fw = (meta or {}).get("framework", "?")
+                chunks.append(f"[Local doc ({fw}): {source}]\n{doc}")
+                sources.append(f"{source}[{fw}]")
+                remaining -= 1
+
+        print(f"[rag] local doc search (frameworks={frameworks}) returned "
+              f"{len(chunks)} chunk(s) from: {sources}", flush=True)
         return chunks
     except Exception as e:
         print(f"[rag] local doc search failed (non-fatal): {e}", flush=True)
         return []
 
 
-def looks_vulnerability_related(question: str) -> bool:
-    q = question.lower()
-    if CVE_PATTERN.search(question):
-        return True
-    return any(kw in q for kw in VULN_KEYWORDS)
-
-
-async def search_nvd(question: str, max_results: int = 3) -> List[str]:
+async def search_nvd(question: str, hint_query: str = None, known_cve_id: str = None,
+                      max_results: int = 3) -> List[str]:
     """Query the public NVD CVE API. Returns a list of text summaries.
-    Returns an empty list on any failure -- never raises."""
+    Returns an empty list on any failure -- never raises.
+
+    Lookup priority:
+    1. An explicit CVE ID literally present in the question (most authoritative)
+    2. known_cve_id -- a CVE ID the orchestrator recognized for a NAMED
+       vulnerability (e.g. "EternalBlue" -> "CVE-2017-0144"). NVD's keyword
+       search only matches literal text in the official CVE description,
+       which almost never includes a vulnerability's popular nickname, so
+       this is the only way named/nicknamed exploits resolve correctly.
+       NVD itself remains the source of truth for all actual facts -- the
+       model only supplies a lookup key, never an answer.
+    3. hint_query / the raw question, as a keyword search fallback for
+       anything not explicitly identified.
+
+    Set NVD_API_KEY env var to avoid aggressive unauthenticated rate
+    limiting (~6s delay per request, occasional ReadTimeouts/404s)."""
     try:
         cve_ids = CVE_PATTERN.findall(question)
         params = {}
         if cve_ids:
             params["cveId"] = cve_ids[0].upper()
+        elif known_cve_id and CVE_PATTERN.fullmatch(known_cve_id.strip()):
+            params["cveId"] = known_cve_id.strip().upper()
         else:
-            params["keywordSearch"] = question
+            search_term = hint_query.strip() if hint_query else question
+            params["keywordSearch"] = search_term
             params["resultsPerPage"] = max_results
 
-        async with httpx.AsyncClient(timeout=15) as client:
-            resp = await client.get(NVD_API_URL, params=params)
+        headers = {}
+        if NVD_API_KEY:
+            headers["apiKey"] = NVD_API_KEY
+
+        async with httpx.AsyncClient(timeout=NVD_TIMEOUT) as client:
+            resp = await client.get(NVD_API_URL, params=params, headers=headers)
             resp.raise_for_status()
             data = resp.json()
 
         vulns = data.get("vulnerabilities", [])[:max_results]
         if not vulns:
-            print("[rag] NVD lookup returned no results", flush=True)
+            print(f"[rag] NVD lookup returned no results (params={params})", flush=True)
             return []
 
         chunks = []
@@ -127,14 +199,5 @@ async def search_nvd(question: str, max_results: int = 3) -> List[str]:
         print(f"[rag] NVD lookup returned {len(chunks)} result(s): {cve_ids_found}", flush=True)
         return chunks
     except Exception as e:
-        print(f"[rag] NVD lookup failed (non-fatal): {e}", flush=True)
+        print(f"[rag] NVD lookup failed (non-fatal): {type(e).__name__}: {e}", flush=True)
         return []
-
-
-async def gather_security_context(question: str) -> List[str]:
-    """Run local-doc search and (if relevant) NVD lookup, merge results."""
-    chunks = await search_local_docs(question)
-    if looks_vulnerability_related(question):
-        nvd_chunks = await search_nvd(question)
-        chunks.extend(nvd_chunks)
-    return chunks
