@@ -1,0 +1,27 @@
+# Template systemd unit for running the agent as a persistent service.
+#
+# 1. Copy this file to /etc/systemd/system/foundation-sec-agent.service
+# 2. Edit the User/Group, WorkingDirectory, and ExecStart paths to match
+#    where you cloned this repo and which user runs it.
+# 3. Create the env file (copy .env.example to /etc/foundation-sec-agent.env,
+#    fill in your real OREILLY_TOKEN, chmod 600, owned by the service user).
+# 4. sudo systemctl daemon-reload
+#    sudo systemctl enable --now foundation-sec-agent.service
+
+[Unit]
+Description=Foundation-Sec + O'Reilly + RAG agent (OpenAI-compatible shim)
+After=network-online.target ollama.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=CHANGE_ME
+Group=CHANGE_ME
+WorkingDirectory=/path/to/foundation-sec-oreilly-agent
+EnvironmentFile=/etc/foundation-sec-agent.env
+ExecStart=/path/to/foundation-sec-oreilly-agent/.venv/bin/uvicorn agent_server:app --host 0.0.0.0 --port 9100
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

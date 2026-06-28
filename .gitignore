@@ -1,0 +1,19 @@
+# Secrets -- never commit these
+.env
+*.env
+!.env.example
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# RAG store (generated locally, can be huge, regenerate via corpus_fetch + ingest_docs.py)
+rag_store/
+
+# Fetched corpus data (regenerate via corpus_fetch scripts; can be 100s of MB)
+corpus_fetch/output/
+
+# OS cruft
+.DS_Store

@@ -1,0 +1,12 @@
+fastapi
+uvicorn[standard]
+pydantic
+langchain-ollama
+langchain-core
+langchain-mcp-adapters
+langgraph
+httpx
+chromadb
+pypdf
+pyyaml
+rdflib
